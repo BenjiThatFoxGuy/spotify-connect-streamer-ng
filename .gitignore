@@ -1,0 +1,4 @@
+/dist/
+/spotify-connect-streamer-ng
+/spot-cache/
+.env
