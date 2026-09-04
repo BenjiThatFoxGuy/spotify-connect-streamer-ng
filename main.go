@@ -62,6 +62,11 @@ type Config struct {
 
 	// Docker-compat fallback: if IcecastURL isn't set directly, it's built
 	// from these, matching the original entrypoint.sh's URL construction.
+	Tunnel  bool
+	NoSetup bool
+
+	// Docker-compat fallback: if IcecastURL isn't set directly, it's built
+	// from these, matching the original entrypoint.sh's URL construction.
 	IcecastHost           string
 	IcecastPort           string
 	IcecastSourcePassword string
@@ -92,6 +97,8 @@ func parseConfig(args []string) (*Config, error) {
 	fs.StringVar(&cfg.LibrespotPath, "librespot-path", "", "Path to the librespot binary (auto-detected if empty)")
 	fs.StringVar(&cfg.FfmpegPath, "ffmpeg-path", "", "Path to the ffmpeg binary (auto-detected if empty)")
 	fs.StringVar(&cfg.LibrespotExtra, "librespot-extra-args", "", "Extra args passed straight through to librespot")
+	fs.BoolVar(&cfg.Tunnel, "tunnel", false, "Start a Cloudflare quick tunnel for public access (auto-downloads cloudflared)")
+	fs.BoolVar(&cfg.NoSetup, "no-setup", false, "Disable automatic dependency downloads")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err
@@ -115,6 +122,13 @@ func parseConfig(args []string) (*Config, error) {
 	cfg.LibrespotPath = envOr("LIBRESPOT_PATH", cfg.LibrespotPath)
 	cfg.FfmpegPath = envOr("FFMPEG_PATH", cfg.FfmpegPath)
 	cfg.LibrespotExtra = envOr("LIBRESPOT_EXTRA_ARGS", cfg.LibrespotExtra)
+
+	if envOr("TUNNEL", "") != "" {
+		cfg.Tunnel = true
+	}
+	if envOr("NO_SETUP", "") != "" {
+		cfg.NoSetup = true
+	}
 
 	cfg.IcecastHost = envOr("ICECAST_HOST", "")
 	cfg.IcecastPort = envOr("ICECAST_PORT", "8000")
@@ -632,6 +646,13 @@ func run() error {
 		return fmt.Errorf("entrypoint: creating cache dir: %w", err)
 	}
 
+	// Auto-download missing dependencies (librespot, ffmpeg).
+	if !cfg.NoSetup {
+		if err := ensureDependencies(cfg); err != nil {
+			return fmt.Errorf("entrypoint: setup failed: %w", err)
+		}
+	}
+
 	logAuthMode(cfg)
 
 	if cfg.UseEmbedded() {
@@ -656,6 +677,27 @@ func run() error {
 		srv = startHTTPServer(ctx, cfg.ListenAddr, bc)
 	}
 
+	// Start Cloudflare tunnel if requested.
+	var tunnelCmd *exec.Cmd
+	if cfg.Tunnel && cfg.UseEmbedded() {
+		cfPath, err := ensureCloudflared()
+		if err != nil {
+			log.Printf("entrypoint: tunnel setup failed: %v", err)
+			log.Println("entrypoint: continuing without tunnel. Stream is still available locally.")
+		} else {
+			cmd, tunnelURL, err := startTunnel(ctx, cfPath, cfg.ListenAddr)
+			if err != nil {
+				log.Printf("entrypoint: tunnel failed to start: %v", err)
+			} else {
+				tunnelCmd = cmd
+				log.Println("========================================")
+				log.Printf("  PUBLIC STREAM URL: %s/stream.mp3", tunnelURL)
+				log.Println("========================================")
+				log.Println("Share this URL with anyone to let them listen!")
+			}
+		}
+	}
+
 	for ctx.Err() == nil {
 		pipelineErr := runPipeline(ctx, cfg, bc)
 		if ctx.Err() != nil {
@@ -669,6 +711,11 @@ func run() error {
 		case <-time.After(restartDelay):
 		case <-ctx.Done():
 		}
+	}
+
+	if tunnelCmd != nil {
+		killProcess(tunnelCmd)
+		_ = tunnelCmd.Wait()
 	}
 
 	if srv != nil {
