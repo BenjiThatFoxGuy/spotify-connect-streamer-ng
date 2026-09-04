@@ -79,10 +79,12 @@ func (c *Config) UseEmbedded() bool {
 	return c.IcecastURL == ""
 }
 
-func parseConfig(args []string) (*Config, error) {
+func parseConfig(args []string) (*Config, bool, string, error) {
 	fs := flag.NewFlagSet("spotify-connect-streamer-ng", flag.ContinueOnError)
 
 	showVersion := fs.Bool("version", false, "Print version and exit")
+	handleEventMode := fs.Bool("handle-event", false, "Internal: act as librespot onevent handler")
+	metadataFile := fs.String("metadata-file", "", "Internal: path to metadata JSON file")
 
 	cfg := &Config{}
 	fs.StringVar(&cfg.DeviceName, "name", "Stream Output", "Name shown in the Spotify Connect device picker")
@@ -101,12 +103,17 @@ func parseConfig(args []string) (*Config, error) {
 	fs.BoolVar(&cfg.NoSetup, "no-setup", false, "Disable automatic dependency downloads")
 
 	if err := fs.Parse(args); err != nil {
-		return nil, err
+		return nil, false, "", err
 	}
 
 	if *showVersion {
 		fmt.Println("spotify-connect-streamer-ng", version)
-		return nil, flag.ErrHelp
+		return nil, false, "", flag.ErrHelp
+	}
+
+	// Onevent handler mode: read env vars and write metadata file, then exit.
+	if *handleEventMode {
+		return nil, true, *metadataFile, nil
 	}
 
 	// Env vars take precedence over flags, for docker compatibility.
@@ -152,7 +159,7 @@ func parseConfig(args []string) (*Config, error) {
 		cfg.FfmpegPath = findBinary("ffmpeg")
 	}
 
-	return cfg, nil
+	return cfg, false, "", nil
 }
 
 // findBinary looks for a binary by name: first in the same directory as our
@@ -335,7 +342,7 @@ func (b *Broadcaster) Write(p []byte) (int, error) {
 // Embedded HTTP streaming server
 // ---------------------------------------------------------------------------
 
-func startHTTPServer(ctx context.Context, addr string, bc *Broadcaster) *http.Server {
+func startHTTPServer(ctx context.Context, addr string, bc *Broadcaster, store *MetadataStore) *http.Server {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/stream.mp3", func(w http.ResponseWriter, r *http.Request) {
@@ -346,32 +353,43 @@ func startHTTPServer(ctx context.Context, addr string, bc *Broadcaster) *http.Se
 			log.Printf("http: listener %d disconnected", id)
 		}()
 
+		// Check if client wants ICY metadata
+		wantsIcy := r.Header.Get("Icy-MetaData") == "1"
+
 		w.Header().Set("Content-Type", "audio/mpeg")
 		w.Header().Set("Cache-Control", "no-cache, no-store")
 		w.Header().Set("Connection", "close")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Icy-Name", "Spotify Connect Stream")
-		w.Header().Set("Transfer-Encoding", "chunked")
+		if wantsIcy {
+			w.Header().Set("Icy-MetaInt", fmt.Sprintf("%d", icyMetaInt))
+		}
 		w.WriteHeader(http.StatusOK)
 
 		flusher, canFlush := w.(http.Flusher)
-		// Flush headers immediately so clients know the stream is live
-		// before any audio data arrives. Without this, browsers and
-		// players may time out waiting for the first byte.
 		if canFlush {
 			flusher.Flush()
+		}
+
+		// Use ICY writer for clients that support it
+		var writer interface{ Write([]byte) (int, error) }
+		if wantsIcy {
+			writer = NewIcyWriter(w, store)
+			log.Printf("http: listener %d using ICY metadata", id)
+		} else {
+			writer = w
 		}
 
 		for {
 			select {
 			case data, ok := <-ch:
 				if !ok {
-					return // channel closed (dropped by broadcaster)
-				}
-				if _, err := w.Write(data); err != nil {
 					return
 				}
-				if canFlush {
+				if _, err := writer.Write(data); err != nil {
+					return
+				}
+				if !wantsIcy && canFlush {
 					flusher.Flush()
 				}
 			case <-r.Context().Done():
@@ -381,6 +399,8 @@ func startHTTPServer(ctx context.Context, addr string, bc *Broadcaster) *http.Se
 			}
 		}
 	})
+
+	mux.HandleFunc("/now-playing", handleNowPlaying(store))
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -432,7 +452,7 @@ func logAuthMode(cfg *Config) {
 	}
 }
 
-func buildLibrespotArgs(cfg *Config) []string {
+func buildLibrespotArgs(cfg *Config, metaFile string) []string {
 	args := []string{
 		"--name", cfg.DeviceName,
 		"--device-type", cfg.DeviceType,
@@ -440,6 +460,11 @@ func buildLibrespotArgs(cfg *Config) []string {
 		"--enable-volume-normalisation",
 		"--cache", cfg.CacheDir,
 		"--disable-gapless",
+	}
+
+	// Wire up metadata events via our own binary as the onevent handler.
+	if metaFile != "" {
+		args = append(args, "--onevent", oneventCommand(metaFile))
 	}
 
 	switch cfg.AuthMode {
@@ -530,8 +555,8 @@ func killProcess(cmd *exec.Cmd) {
 // Pipeline
 // ---------------------------------------------------------------------------
 
-func runPipeline(ctx context.Context, cfg *Config, bc *Broadcaster) error {
-	librespotArgs := append(buildLibrespotArgs(cfg), "--backend", "pipe")
+func runPipeline(ctx context.Context, cfg *Config, bc *Broadcaster, metaFile string) error {
+	librespotArgs := append(buildLibrespotArgs(cfg, metaFile), "--backend", "pipe")
 
 	// Build ffmpeg args. Output destination depends on mode.
 	ffmpegArgs := []string{
@@ -660,12 +685,20 @@ func runPipeline(ctx context.Context, cfg *Config, bc *Broadcaster) error {
 func run() error {
 	log.SetFlags(0)
 
-	cfg, err := parseConfig(os.Args[1:])
+	cfg, isEventHandler, eventMetaFile, err := parseConfig(os.Args[1:])
 	if err != nil {
 		if err == flag.ErrHelp {
 			return nil
 		}
 		return err
+	}
+
+	// Onevent handler mode: write metadata and exit.
+	if isEventHandler {
+		if eventMetaFile == "" {
+			return fmt.Errorf("--metadata-file is required with --handle-event")
+		}
+		return handleEvent(eventMetaFile)
 	}
 
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
@@ -696,11 +729,17 @@ func run() error {
 		}
 	}
 
+	// Set up metadata tracking.
+	metaStore := NewMetadataStore()
+	metaFile := metadataFilePath(cfg.CacheDir)
+	metaDone := make(chan struct{})
+	go watchMetadataFile(metaStore, metaFile, metaDone)
+
 	// Create broadcaster and start HTTP server (embedded mode).
 	bc := NewBroadcaster()
 	var srv *http.Server
 	if cfg.UseEmbedded() {
-		srv = startHTTPServer(ctx, cfg.ListenAddr, bc)
+		srv = startHTTPServer(ctx, cfg.ListenAddr, bc, metaStore)
 	}
 
 	// Start Cloudflare tunnel if requested.
@@ -718,6 +757,7 @@ func run() error {
 				tunnelCmd = cmd
 				log.Println("========================================")
 				log.Printf("  PUBLIC STREAM URL: %s/stream.mp3", tunnelURL)
+				log.Println("  NOW PLAYING:      %s/now-playing", tunnelURL)
 				log.Println("========================================")
 				log.Println("Share this URL with anyone to let them listen!")
 			}
@@ -725,7 +765,7 @@ func run() error {
 	}
 
 	for ctx.Err() == nil {
-		pipelineErr := runPipeline(ctx, cfg, bc)
+		pipelineErr := runPipeline(ctx, cfg, bc, metaFile)
 		if ctx.Err() != nil {
 			break
 		}
@@ -738,6 +778,8 @@ func run() error {
 		case <-ctx.Done():
 		}
 	}
+
+	close(metaDone)
 
 	if tunnelCmd != nil {
 		killProcess(tunnelCmd)
