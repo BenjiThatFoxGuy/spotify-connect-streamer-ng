@@ -97,7 +97,7 @@ func parseConfig(args []string) (*Config, error) {
 	fs.StringVar(&cfg.LibrespotPath, "librespot-path", "", "Path to the librespot binary (auto-detected if empty)")
 	fs.StringVar(&cfg.FfmpegPath, "ffmpeg-path", "", "Path to the ffmpeg binary (auto-detected if empty)")
 	fs.StringVar(&cfg.LibrespotExtra, "librespot-extra-args", "", "Extra args passed straight through to librespot")
-	fs.BoolVar(&cfg.Tunnel, "tunnel", false, "Start a Cloudflare quick tunnel for public access (auto-downloads cloudflared)")
+	fs.BoolVar(&cfg.Tunnel, "tunnel", true, "Start a Cloudflare quick tunnel for public access (disable with --tunnel=false)")
 	fs.BoolVar(&cfg.NoSetup, "no-setup", false, "Disable automatic dependency downloads")
 
 	if err := fs.Parse(args); err != nil {

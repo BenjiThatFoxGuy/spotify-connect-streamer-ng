@@ -1,0 +1,46 @@
+name: nightly
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build all platforms
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build all platforms
+        run: make all VERSION=nightly-$(date +%Y%m%d)-$(git rev-parse --short HEAD)
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+
+      - name: Delete existing nightly release
+        run: gh release delete nightly --yes 2>/dev/null || true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete nightly tag
+        run: git push origin :refs/tags/nightly 2>/dev/null || true
+
+      - name: Create rolling nightly release
+        run: |
+          gh release create nightly \
+            --title "Nightly Build" \
+            --notes "Automated build from main. Updated on every push. Just download the exe for your platform and run it - everything else is auto-downloaded on first launch." \
+            --prerelease \
+            dist/*
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
