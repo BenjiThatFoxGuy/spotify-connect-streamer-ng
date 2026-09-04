@@ -39,7 +39,6 @@ FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    pv \
     ca-certificates \
     libasound2 \
     alsa-utils \
@@ -47,5 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=librespot-builder /build/target/release/librespot /usr/local/bin/librespot
 COPY --from=go-builder /out/spotify-connect-streamer-ng /usr/local/bin/spotify-connect-streamer-ng
+
+EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/spotify-connect-streamer-ng"]

@@ -1,47 +1,56 @@
 // Command spotify-connect-streamer-ng orchestrates librespot and ffmpeg to
-// turn a Spotify Connect device into a plain HTTP MP3 stream pushed to an
-// icecast server. It is a Go port of the entrypoint.sh from the Docker-based
-// spotify-connect-streamer project: same pipeline, same restart-on-death
-// behavior, minus the shell.
+// turn a Spotify Connect device into a plain HTTP MP3 stream.
 //
-//	librespot (Connect device, raw PCM) -> pv (rate limiter) -> ffmpeg (MP3 encode) -> icecast
+// Two output modes:
+//   - Embedded (default): serves the stream on a built-in HTTP server.
+//     Just open http://localhost:8080/stream.mp3 in any player.
+//   - Icecast: pushes to an external icecast server (backward-compatible
+//     with the original docker-based project).
+//
+// The pv rate limiter from the original shell pipeline is replaced with a
+// Go-native implementation, eliminating the pv dependency entirely.
+//
+//	librespot (Connect device, raw PCM) -> Go rate limiter -> ffmpeg (MP3 encode) -> embedded HTTP / icecast
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
-// pvRateBytesPerSec is the byte rate pv throttles the pipe to: 44100Hz *
-// 2 channels * 2 bytes/sample (16-bit PCM stereo). Pacing the pipe at
-// real-time playback speed keeps librespot from downloading faster than
-// playback, which is what causes Spotify to think a track finished early
-// and skip ahead.
-const pvRateBytesPerSec = "176400"
+// pvRateBytesPerSec is the byte rate the rate limiter throttles the pipe to:
+// 44100Hz * 2 channels * 2 bytes/sample (16-bit PCM stereo). Pacing the pipe
+// at real-time playback speed keeps librespot from downloading faster than
+// playback, which is what causes Spotify to think a track finished early and
+// skip ahead.
+const pvRateBytesPerSec = 176400
 
 const restartDelay = 3 * time.Second
 
 // version is stamped at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
-// Config holds the fully-resolved runtime configuration: flag defaults,
-// overridden by explicit flags, overridden again by environment variables
-// (env wins, for docker compatibility).
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
 type Config struct {
 	DeviceName      string
 	DeviceType      string
-	Backend         string
 	Bitrate         string
+	ListenAddr      string
 	IcecastURL      string
 	CacheDir        string
 	AuthMode        string
@@ -49,7 +58,6 @@ type Config struct {
 	SpotifyPassword string
 	LibrespotPath   string
 	FfmpegPath      string
-	PvPath          string
 	LibrespotExtra  string
 
 	// Docker-compat fallback: if IcecastURL isn't set directly, it's built
@@ -60,6 +68,12 @@ type Config struct {
 	MountPoint            string
 }
 
+// UseEmbedded returns true when the built-in HTTP server should be used
+// instead of pushing to icecast.
+func (c *Config) UseEmbedded() bool {
+	return c.IcecastURL == ""
+}
+
 func parseConfig(args []string) (*Config, error) {
 	fs := flag.NewFlagSet("spotify-connect-streamer-ng", flag.ContinueOnError)
 
@@ -68,16 +82,15 @@ func parseConfig(args []string) (*Config, error) {
 	cfg := &Config{}
 	fs.StringVar(&cfg.DeviceName, "name", "Stream Output", "Name shown in the Spotify Connect device picker")
 	fs.StringVar(&cfg.DeviceType, "device-type", "speaker", "Device type shown in Spotify")
-	fs.StringVar(&cfg.Backend, "backend", "pipe-pv", "Audio pipeline backend (only pipe-pv is implemented)")
 	fs.StringVar(&cfg.Bitrate, "bitrate", "320k", "MP3 encoding bitrate")
-	fs.StringVar(&cfg.IcecastURL, "icecast-url", "", "Full icecast destination URL, e.g. icecast://source:pass@host:8000/stream.mp3 (required)")
+	fs.StringVar(&cfg.ListenAddr, "listen", ":8080", "Listen address for the embedded HTTP streaming server")
+	fs.StringVar(&cfg.IcecastURL, "icecast-url", "", "Icecast destination URL (if set, disables embedded server)")
 	fs.StringVar(&cfg.CacheDir, "cache-dir", "~/.cache/spotify-streamer", "librespot cache/credentials directory")
 	fs.StringVar(&cfg.AuthMode, "auth-mode", "zeroconf", "Auth mode: zeroconf, device-auth, or password")
 	fs.StringVar(&cfg.SpotifyUsername, "spotify-username", "", "Spotify username (auth-mode=password only)")
 	fs.StringVar(&cfg.SpotifyPassword, "spotify-password", "", "Spotify password (auth-mode=password only)")
-	fs.StringVar(&cfg.LibrespotPath, "librespot-path", "librespot", "Path to the librespot binary")
-	fs.StringVar(&cfg.FfmpegPath, "ffmpeg-path", "ffmpeg", "Path to the ffmpeg binary")
-	fs.StringVar(&cfg.PvPath, "pv-path", "pv", "Path to the pv binary")
+	fs.StringVar(&cfg.LibrespotPath, "librespot-path", "", "Path to the librespot binary (auto-detected if empty)")
+	fs.StringVar(&cfg.FfmpegPath, "ffmpeg-path", "", "Path to the ffmpeg binary (auto-detected if empty)")
 	fs.StringVar(&cfg.LibrespotExtra, "librespot-extra-args", "", "Extra args passed straight through to librespot")
 
 	if err := fs.Parse(args); err != nil {
@@ -92,8 +105,8 @@ func parseConfig(args []string) (*Config, error) {
 	// Env vars take precedence over flags, for docker compatibility.
 	cfg.DeviceName = envOr("DEVICE_NAME", cfg.DeviceName)
 	cfg.DeviceType = envOr("DEVICE_TYPE", cfg.DeviceType)
-	cfg.Backend = envOr("BACKEND", cfg.Backend)
 	cfg.Bitrate = envOr("MP3_BITRATE", cfg.Bitrate)
+	cfg.ListenAddr = envOr("LISTEN_ADDR", cfg.ListenAddr)
 	cfg.IcecastURL = envOr("ICECAST_URL", cfg.IcecastURL)
 	cfg.CacheDir = envOr("CACHE_DIR", cfg.CacheDir)
 	cfg.AuthMode = envOr("AUTH_MODE", cfg.AuthMode)
@@ -101,7 +114,6 @@ func parseConfig(args []string) (*Config, error) {
 	cfg.SpotifyPassword = envOr("SPOTIFY_PASSWORD", cfg.SpotifyPassword)
 	cfg.LibrespotPath = envOr("LIBRESPOT_PATH", cfg.LibrespotPath)
 	cfg.FfmpegPath = envOr("FFMPEG_PATH", cfg.FfmpegPath)
-	cfg.PvPath = envOr("PV_PATH", cfg.PvPath)
 	cfg.LibrespotExtra = envOr("LIBRESPOT_EXTRA_ARGS", cfg.LibrespotExtra)
 
 	cfg.IcecastHost = envOr("ICECAST_HOST", "")
@@ -110,8 +122,7 @@ func parseConfig(args []string) (*Config, error) {
 	cfg.MountPoint = envOr("MOUNT_POINT", "stream.mp3")
 
 	// docker-compose compat: if ICECAST_URL wasn't given directly but the
-	// discrete pieces were (as in the original docker-compose.yml), build
-	// the URL the same way entrypoint.sh did.
+	// discrete pieces were, build the URL the same way entrypoint.sh did.
 	if cfg.IcecastURL == "" && cfg.IcecastHost != "" && cfg.IcecastSourcePassword != "" {
 		cfg.IcecastURL = fmt.Sprintf("icecast://source:%s@%s:%s/%s",
 			cfg.IcecastSourcePassword, cfg.IcecastHost, cfg.IcecastPort, cfg.MountPoint)
@@ -119,7 +130,39 @@ func parseConfig(args []string) (*Config, error) {
 
 	cfg.CacheDir = expandHome(cfg.CacheDir)
 
+	// Auto-detect binary paths: look next to ourselves first, then PATH.
+	if cfg.LibrespotPath == "" {
+		cfg.LibrespotPath = findBinary("librespot")
+	}
+	if cfg.FfmpegPath == "" {
+		cfg.FfmpegPath = findBinary("ffmpeg")
+	}
+
 	return cfg, nil
+}
+
+// findBinary looks for a binary by name: first in the same directory as our
+// own executable (for portable/bundled deploys), then via PATH.
+func findBinary(name string) string {
+	if runtime.GOOS == "windows" {
+		name = name + ".exe"
+	}
+
+	// Check next to our own executable.
+	if self, err := os.Executable(); err == nil {
+		candidate := filepath.Join(filepath.Dir(self), name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// Fall back to PATH.
+	if p, err := exec.LookPath(name); err == nil {
+		return p
+	}
+
+	// Return bare name and let exec.Command fail with a clear error later.
+	return name
 }
 
 func envOr(key, fallback string) string {
@@ -140,14 +183,201 @@ func expandHome(path string) string {
 	if path == "~" {
 		return home
 	}
-	if strings.HasPrefix(path, "~/") {
+	if strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
 		return filepath.Join(home, path[2:])
 	}
 	return path
 }
 
-// logAuthMode mirrors the log lines entrypoint.sh printed for each auth
-// mode, so behavior watching logs sees the same story.
+// ---------------------------------------------------------------------------
+// Rate-limited pipe (replaces pv)
+// ---------------------------------------------------------------------------
+
+// rateLimitedCopy copies from src to dst at bytesPerSec, pacing writes so
+// librespot doesn't race ahead of real-time playback. This replaces the pv
+// binary from the shell pipeline.
+func rateLimitedCopy(ctx context.Context, dst io.Writer, src io.Reader, bytesPerSec int) error {
+	buf := make([]byte, 8192)
+	start := time.Now()
+	var totalWritten int64
+
+	for {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		n, readErr := src.Read(buf)
+		if n > 0 {
+			// How many bytes should have been written by now?
+			elapsed := time.Since(start)
+			allowed := int64(elapsed.Seconds() * float64(bytesPerSec))
+			ahead := totalWritten + int64(n) - allowed
+
+			if ahead > 0 {
+				// We're ahead of real-time. Sleep to let playback catch up.
+				sleepDur := time.Duration(float64(ahead) / float64(bytesPerSec) * float64(time.Second))
+				select {
+				case <-time.After(sleepDur):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+
+			written, writeErr := dst.Write(buf[:n])
+			totalWritten += int64(written)
+			if writeErr != nil {
+				return writeErr
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// MP3 stream broadcaster (for embedded HTTP mode)
+// ---------------------------------------------------------------------------
+
+// Broadcaster fans out MP3 data from ffmpeg to all connected HTTP clients.
+type Broadcaster struct {
+	mu        sync.Mutex
+	listeners map[int]chan []byte
+	nextID    int
+}
+
+func NewBroadcaster() *Broadcaster {
+	return &Broadcaster{
+		listeners: make(map[int]chan []byte),
+	}
+}
+
+func (b *Broadcaster) Subscribe() (int, <-chan []byte) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id := b.nextID
+	b.nextID++
+	ch := make(chan []byte, 128)
+	b.listeners[id] = ch
+	return id, ch
+}
+
+func (b *Broadcaster) Unsubscribe(id int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ch, ok := b.listeners[id]; ok {
+		close(ch)
+		delete(b.listeners, id)
+	}
+}
+
+func (b *Broadcaster) Count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.listeners)
+}
+
+// Write implements io.Writer so ffmpeg's stdout can be piped directly here.
+func (b *Broadcaster) Write(p []byte) (int, error) {
+	// Copy the data since the caller's buffer will be reused.
+	data := make([]byte, len(p))
+	copy(data, p)
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for id, ch := range b.listeners {
+		select {
+		case ch <- data:
+		default:
+			// Slow reader - drop them.
+			close(ch)
+			delete(b.listeners, id)
+			log.Printf("http: dropped slow listener %d", id)
+		}
+	}
+	return len(p), nil
+}
+
+// ---------------------------------------------------------------------------
+// Embedded HTTP streaming server
+// ---------------------------------------------------------------------------
+
+func startHTTPServer(ctx context.Context, addr string, bc *Broadcaster) *http.Server {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/stream.mp3", func(w http.ResponseWriter, r *http.Request) {
+		id, ch := bc.Subscribe()
+		log.Printf("http: listener %d connected from %s", id, r.RemoteAddr)
+		defer func() {
+			bc.Unsubscribe(id)
+			log.Printf("http: listener %d disconnected", id)
+		}()
+
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Header().Set("Cache-Control", "no-cache, no-store")
+		w.Header().Set("Connection", "close")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Icy-Name", "Spotify Connect Stream")
+		w.WriteHeader(http.StatusOK)
+
+		flusher, canFlush := w.(http.Flusher)
+
+		for {
+			select {
+			case data, ok := <-ch:
+				if !ok {
+					return // channel closed (dropped by broadcaster)
+				}
+				if _, err := w.Write(data); err != nil {
+					return
+				}
+				if canFlush {
+					flusher.Flush()
+				}
+			case <-r.Context().Done():
+				return
+			case <-ctx.Done():
+				return
+			}
+		}
+	})
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprintf(w, `<!DOCTYPE html>
+<html><head><title>Spotify Connect Stream</title></head>
+<body style="font-family:sans-serif;max-width:600px;margin:2em auto">
+<h1>Spotify Connect Stream</h1>
+<p>Stream URL: <code>http://%s/stream.mp3</code></p>
+<p>Listeners: %d</p>
+<audio controls autoplay src="/stream.mp3"></audio>
+<p style="color:#666;font-size:0.9em">spotify-connect-streamer-ng %s</p>
+</body></html>`, r.Host, bc.Count(), version)
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	go func() {
+		log.Printf("http: serving stream on %s/stream.mp3", addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Printf("http: server error: %v", err)
+		}
+	}()
+
+	return srv
+}
+
+// ---------------------------------------------------------------------------
+// Auth & librespot
+// ---------------------------------------------------------------------------
+
 func logAuthMode(cfg *Config) {
 	switch cfg.AuthMode {
 	case "device-auth":
@@ -165,8 +395,6 @@ func logAuthMode(cfg *Config) {
 	}
 }
 
-// buildLibrespotArgs assembles the librespot flags shared by the streaming
-// pipeline, mirroring entrypoint.sh's librespot_base_args.
 func buildLibrespotArgs(cfg *Config) []string {
 	args := []string{
 		"--name", cfg.DeviceName,
@@ -193,10 +421,6 @@ func buildLibrespotArgs(cfg *Config) []string {
 	return args
 }
 
-// ensureCredentialsPaired handles first-time device-auth pairing: if no
-// cached credentials exist yet, it runs librespot standalone (discarding
-// its audio output) until credentials.json appears or 120s elapse, exactly
-// like the pairing block in entrypoint.sh.
 func ensureCredentialsPaired(ctx context.Context, cfg *Config) error {
 	credPath := filepath.Join(cfg.CacheDir, "credentials.json")
 	if _, err := os.Stat(credPath); err == nil {
@@ -219,7 +443,6 @@ func ensureCredentialsPaired(ctx context.Context, cfg *Config) error {
 	}
 	cmd := exec.CommandContext(pairCtx, cfg.LibrespotPath, args...)
 	cmd.Stderr = os.Stderr
-	// Stdout left nil: raw PCM output is discarded, same as `> /dev/null`.
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting librespot for pairing: %w", err)
@@ -236,7 +459,7 @@ func ensureCredentialsPaired(ctx context.Context, cfg *Config) error {
 		case <-ticker.C:
 			if _, err := os.Stat(credPath); err == nil {
 				log.Println("entrypoint: pairing successful! credentials cached.")
-				_ = cmd.Process.Signal(syscall.SIGTERM)
+				killProcess(cmd)
 				<-waitErr
 				return nil
 			}
@@ -244,129 +467,155 @@ func ensureCredentialsPaired(ctx context.Context, cfg *Config) error {
 			if _, err := os.Stat(credPath); err != nil {
 				log.Println("entrypoint: pairing timed out after 120s. continuing anyway...")
 			}
-			_ = cmd.Process.Signal(syscall.SIGTERM)
+			killProcess(cmd)
 			<-waitErr
 			return nil
 		case err := <-waitErr:
-			// librespot exited on its own before pairing or timeout.
 			return err
 		}
 	}
 }
 
-// runPipeline runs one pass of the pipe-pv backend:
-//
-//	librespot --backend pipe | pv -qL 176400 | ffmpeg -> icecast
-//
-// wired up with real OS pipes (not io.Copy goroutines) so behavior matches
-// the shell version's pipe semantics: EOF propagates naturally when a stage
-// exits, and each process gets its own fd rather than sharing one through
-// Go-side buffering.
-func runPipeline(ctx context.Context, cfg *Config) error {
+// killProcess terminates a process. On Unix this sends SIGTERM for a graceful
+// exit; on Windows it kills immediately (SIGTERM is not supported).
+func killProcess(cmd *exec.Cmd) {
+	if cmd.Process == nil {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		_ = cmd.Process.Kill()
+	} else {
+		_ = cmd.Process.Signal(os.Interrupt)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline
+// ---------------------------------------------------------------------------
+
+func runPipeline(ctx context.Context, cfg *Config, bc *Broadcaster) error {
 	librespotArgs := append(buildLibrespotArgs(cfg), "--backend", "pipe")
 
+	// Build ffmpeg args. Output destination depends on mode.
 	ffmpegArgs := []string{
 		"-loglevel", "warning",
 		"-f", "s16le", "-ar", "44100", "-ac", "2", "-i", "pipe:0",
 		"-af", "aresample=async=1",
 		"-f", "mp3", "-b:a", cfg.Bitrate,
-		"-flush_packets", "1",
-		"-content_type", "audio/mpeg",
-		cfg.IcecastURL,
+	}
+	if cfg.UseEmbedded() {
+		// Output to stdout - we'll read it and broadcast via HTTP.
+		ffmpegArgs = append(ffmpegArgs, "pipe:1")
+	} else {
+		// Push to icecast directly.
+		ffmpegArgs = append(ffmpegArgs,
+			"-flush_packets", "1",
+			"-content_type", "audio/mpeg",
+			cfg.IcecastURL,
+		)
 	}
 
 	librespotCmd := exec.Command(cfg.LibrespotPath, librespotArgs...)
-	pvCmd := exec.Command(cfg.PvPath, "-qL", pvRateBytesPerSec)
 	ffmpegCmd := exec.Command(cfg.FfmpegPath, ffmpegArgs...)
 
 	librespotCmd.Stderr = os.Stderr
-	pvCmd.Stderr = os.Stderr
 	ffmpegCmd.Stderr = os.Stderr
 
-	r1, w1, err := os.Pipe()
+	// librespot stdout -> rate limiter -> ffmpeg stdin
+	// We use OS pipes for librespot's output, then a Go goroutine rate-limits
+	// the copy into ffmpeg's stdin pipe.
+	librespotOut, librespotOutW, err := os.Pipe()
 	if err != nil {
-		return fmt.Errorf("creating librespot->pv pipe: %w", err)
+		return fmt.Errorf("creating librespot output pipe: %w", err)
 	}
-	r2, w2, err := os.Pipe()
+
+	ffmpegIn, ffmpegInW, err := os.Pipe()
 	if err != nil {
-		r1.Close()
-		w1.Close()
-		return fmt.Errorf("creating pv->ffmpeg pipe: %w", err)
+		librespotOut.Close()
+		librespotOutW.Close()
+		return fmt.Errorf("creating ffmpeg input pipe: %w", err)
 	}
 
-	librespotCmd.Stdout = w1
-	pvCmd.Stdin = r1
-	pvCmd.Stdout = w2
-	ffmpegCmd.Stdin = r2
+	librespotCmd.Stdout = librespotOutW
+	ffmpegCmd.Stdin = ffmpegIn
 
-	cmds := []*exec.Cmd{librespotCmd, pvCmd, ffmpegCmd}
-	names := []string{"librespot", "pv", "ffmpeg"}
-
-	closeParentPipeEnds := func() {
-		r1.Close()
-		w1.Close()
-		r2.Close()
-		w2.Close()
+	// In embedded mode, ffmpeg writes to stdout which we capture.
+	if cfg.UseEmbedded() {
+		ffmpegCmd.Stdout = bc
 	}
 
-	for i, cmd := range cmds {
-		if startErr := cmd.Start(); startErr != nil {
-			for _, started := range cmds[:i] {
-				if started.Process != nil {
-					_ = started.Process.Kill()
-				}
-			}
-			closeParentPipeEnds()
-			return fmt.Errorf("starting %s: %w", names[i], startErr)
-		}
+	// Start both processes.
+	if err := librespotCmd.Start(); err != nil {
+		librespotOut.Close()
+		librespotOutW.Close()
+		ffmpegIn.Close()
+		ffmpegInW.Close()
+		return fmt.Errorf("starting librespot: %w", err)
 	}
 
-	// Children now hold their own dup'd copies of the pipe fds; the parent
-	// must close its copies so EOF propagates when a stage exits instead
-	// of being held open by us.
-	closeParentPipeEnds()
+	if err := ffmpegCmd.Start(); err != nil {
+		killProcess(librespotCmd)
+		librespotOut.Close()
+		librespotOutW.Close()
+		ffmpegIn.Close()
+		ffmpegInW.Close()
+		return fmt.Errorf("starting ffmpeg: %w", err)
+	}
 
+	// Close parent-side pipe ends that the children now hold.
+	librespotOutW.Close()
+	ffmpegIn.Close()
+
+	// Rate-limited copy goroutine (replaces pv).
+	rateLimitDone := make(chan error, 1)
+	go func() {
+		err := rateLimitedCopy(ctx, ffmpegInW, librespotOut, pvRateBytesPerSec)
+		ffmpegInW.Close()  // Signal EOF to ffmpeg.
+		librespotOut.Close()
+		rateLimitDone <- err
+	}()
+
+	// Context cancellation: kill both processes.
 	watchDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			for _, cmd := range cmds {
-				if cmd.Process != nil {
-					_ = cmd.Process.Signal(syscall.SIGTERM)
-				}
-			}
+			killProcess(librespotCmd)
+			killProcess(ffmpegCmd)
 		case <-watchDone:
 		}
 	}()
 
-	var wg sync.WaitGroup
-	errs := make([]error, len(cmds))
-	for i, cmd := range cmds {
-		wg.Add(1)
-		go func(i int, cmd *exec.Cmd) {
-			defer wg.Done()
-			errs[i] = cmd.Wait()
-		}(i, cmd)
-	}
-	wg.Wait()
+	// Wait for both processes.
+	librespotErr := make(chan error, 1)
+	ffmpegErr := make(chan error, 1)
+	go func() { librespotErr <- librespotCmd.Wait() }()
+	go func() { ffmpegErr <- ffmpegCmd.Wait() }()
+
+	lErr := <-librespotErr
+	fErr := <-ffmpegErr
+	<-rateLimitDone
 	close(watchDone)
 
-	for i, e := range errs {
-		if e != nil {
-			log.Printf("entrypoint: %s exited: %v", names[i], e)
-		}
+	if lErr != nil {
+		log.Printf("entrypoint: librespot exited: %v", lErr)
+	}
+	if fErr != nil {
+		log.Printf("entrypoint: ffmpeg exited: %v", fErr)
 	}
 
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	for _, e := range errs {
-		if e != nil {
-			return e
-		}
+	if lErr != nil {
+		return lErr
 	}
-	return nil
+	return fErr
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 func run() error {
 	log.SetFlags(0)
@@ -379,23 +628,19 @@ func run() error {
 		return err
 	}
 
-	if cfg.IcecastURL == "" {
-		return fmt.Errorf("entrypoint: --icecast-url / ICECAST_URL is not set, refusing to start")
-	}
-
 	if err := os.MkdirAll(cfg.CacheDir, 0o755); err != nil {
 		return fmt.Errorf("entrypoint: creating cache dir: %w", err)
 	}
 
-	if cfg.Backend != "pipe-pv" {
-		log.Printf("entrypoint: backend %q not supported by this build, falling back to pipe-pv", cfg.Backend)
-		cfg.Backend = "pipe-pv"
+	logAuthMode(cfg)
+
+	if cfg.UseEmbedded() {
+		log.Printf("entrypoint: embedded mode, will serve stream on %s", cfg.ListenAddr)
+	} else {
+		log.Printf("entrypoint: icecast mode, streaming to %s", cfg.IcecastURL)
 	}
 
-	logAuthMode(cfg)
-	log.Printf("entrypoint: backend=%s, streaming to %s", cfg.Backend, cfg.IcecastURL)
-
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
 	if cfg.AuthMode == "device-auth" {
@@ -404,8 +649,15 @@ func run() error {
 		}
 	}
 
+	// Create broadcaster and start HTTP server (embedded mode).
+	bc := NewBroadcaster()
+	var srv *http.Server
+	if cfg.UseEmbedded() {
+		srv = startHTTPServer(ctx, cfg.ListenAddr, bc)
+	}
+
 	for ctx.Err() == nil {
-		pipelineErr := runPipeline(ctx, cfg)
+		pipelineErr := runPipeline(ctx, cfg, bc)
 		if ctx.Err() != nil {
 			break
 		}
@@ -417,6 +669,12 @@ func run() error {
 		case <-time.After(restartDelay):
 		case <-ctx.Done():
 		}
+	}
+
+	if srv != nil {
+		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutCtx)
 	}
 
 	log.Println("entrypoint: shutting down")
