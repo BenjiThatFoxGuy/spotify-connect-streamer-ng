@@ -214,6 +214,7 @@ func rateLimitedCopy(ctx context.Context, dst io.Writer, src io.Reader, bytesPer
 	buf := make([]byte, 8192)
 	start := time.Now()
 	var totalWritten int64
+	var loggedFirst bool
 
 	for {
 		if ctx.Err() != nil {
@@ -222,6 +223,10 @@ func rateLimitedCopy(ctx context.Context, dst io.Writer, src io.Reader, bytesPer
 
 		n, readErr := src.Read(buf)
 		if n > 0 {
+			if !loggedFirst {
+				loggedFirst = true
+				log.Printf("pipeline: first PCM data from librespot (%d bytes)", n)
+			}
 			// How many bytes should have been written by now?
 			elapsed := time.Since(start)
 			allowed := int64(elapsed.Seconds() * float64(bytesPerSec))
@@ -261,6 +266,7 @@ type Broadcaster struct {
 	mu        sync.Mutex
 	listeners map[int]chan []byte
 	nextID    int
+	gotData   bool
 }
 
 func NewBroadcaster() *Broadcaster {
@@ -296,6 +302,16 @@ func (b *Broadcaster) Count() int {
 
 // Write implements io.Writer so ffmpeg's stdout can be piped directly here.
 func (b *Broadcaster) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	first := !b.gotData
+	if first {
+		b.gotData = true
+	}
+	b.mu.Unlock()
+	if first {
+		log.Printf("broadcast: first MP3 data received (%d bytes), stream is live", len(p))
+	}
+
 	// Copy the data since the caller's buffer will be reused.
 	data := make([]byte, len(p))
 	copy(data, p)
@@ -335,9 +351,16 @@ func startHTTPServer(ctx context.Context, addr string, bc *Broadcaster) *http.Se
 		w.Header().Set("Connection", "close")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Icy-Name", "Spotify Connect Stream")
+		w.Header().Set("Transfer-Encoding", "chunked")
 		w.WriteHeader(http.StatusOK)
 
 		flusher, canFlush := w.(http.Flusher)
+		// Flush headers immediately so clients know the stream is live
+		// before any audio data arrives. Without this, browsers and
+		// players may time out waiting for the first byte.
+		if canFlush {
+			flusher.Flush()
+		}
 
 		for {
 			select {
@@ -519,7 +542,10 @@ func runPipeline(ctx context.Context, cfg *Config, bc *Broadcaster) error {
 	}
 	if cfg.UseEmbedded() {
 		// Output to stdout - we'll read it and broadcast via HTTP.
-		ffmpegArgs = append(ffmpegArgs, "pipe:1")
+		// flush_packets=1 is critical: without it ffmpeg buffers internally
+		// and listeners get no data for several seconds, causing them to
+		// disconnect and reconnect in a loop.
+		ffmpegArgs = append(ffmpegArgs, "-flush_packets", "1", "pipe:1")
 	} else {
 		// Push to icecast directly.
 		ffmpegArgs = append(ffmpegArgs,
