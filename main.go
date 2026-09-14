@@ -60,6 +60,10 @@ type Config struct {
 	FfmpegPath      string
 	LibrespotExtra  string
 
+	// When true, disables mDNS/zeroconf LAN discovery. The device is only
+	// reachable via Spotify's servers. Requires an account auth mode.
+	DisableDiscovery bool
+
 	// Docker-compat fallback: if IcecastURL isn't set directly, it's built
 	// from these, matching the original entrypoint.sh's URL construction.
 	Tunnel  bool
@@ -99,6 +103,7 @@ func parseConfig(args []string) (*Config, bool, string, error) {
 	fs.StringVar(&cfg.LibrespotPath, "librespot-path", "", "Path to the librespot binary (auto-detected if empty)")
 	fs.StringVar(&cfg.FfmpegPath, "ffmpeg-path", "", "Path to the ffmpeg binary (auto-detected if empty)")
 	fs.StringVar(&cfg.LibrespotExtra, "librespot-extra-args", "", "Extra args passed straight through to librespot")
+	fs.BoolVar(&cfg.DisableDiscovery, "disable-discovery", false, "Hide from LAN (mDNS/zeroconf off). Requires account auth mode.")
 	fs.BoolVar(&cfg.Tunnel, "tunnel", true, "Start a Cloudflare quick tunnel for public access (disable with --tunnel=false)")
 	fs.BoolVar(&cfg.NoSetup, "no-setup", false, "Disable automatic dependency downloads")
 
@@ -130,6 +135,9 @@ func parseConfig(args []string) (*Config, bool, string, error) {
 	cfg.FfmpegPath = envOr("FFMPEG_PATH", cfg.FfmpegPath)
 	cfg.LibrespotExtra = envOr("LIBRESPOT_EXTRA_ARGS", cfg.LibrespotExtra)
 
+	if envOr("DISABLE_DISCOVERY", "") == "true" {
+		cfg.DisableDiscovery = true
+	}
 	if envOr("TUNNEL", "") != "" {
 		cfg.Tunnel = true
 	}
@@ -473,6 +481,16 @@ func buildLibrespotArgs(cfg *Config, metaFile string) []string {
 	case "password":
 		if cfg.SpotifyUsername != "" && cfg.SpotifyPassword != "" {
 			args = append(args, "--username", cfg.SpotifyUsername, "--password", cfg.SpotifyPassword)
+		}
+	}
+
+	// Disable LAN discovery (only valid with account credentials)
+	if cfg.DisableDiscovery {
+		if cfg.AuthMode == "zeroconf" || cfg.AuthMode == "" {
+			log.Println("entrypoint: DISABLE_DISCOVERY requires an account auth mode (device-auth or password). Ignoring.")
+		} else {
+			log.Println("entrypoint: LAN discovery disabled - device only reachable via Spotify servers")
+			args = append(args, "--disable-discovery")
 		}
 	}
 
