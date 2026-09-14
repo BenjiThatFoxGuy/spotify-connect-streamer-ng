@@ -487,7 +487,9 @@ func buildLibrespotArgs(cfg *Config, metaFile string) []string {
 	// Disable LAN discovery (only valid with account credentials)
 	if cfg.DisableDiscovery {
 		if cfg.AuthMode == "zeroconf" || cfg.AuthMode == "" {
-			log.Println("entrypoint: DISABLE_DISCOVERY requires an account auth mode (device-auth or password). Ignoring.")
+			log.Printf("entrypoint: WARNING: disable-discovery is set but auth mode is %q.", cfg.AuthMode)
+			log.Println("entrypoint: WARNING: Disabling discovery without account credentials would make the device unreachable.")
+			log.Println("entrypoint: WARNING: LAN discovery will remain ENABLED. Set auth mode to device-auth or password to use disable-discovery.")
 		} else {
 			log.Println("entrypoint: LAN discovery disabled - device only reachable via Spotify servers")
 			args = append(args, "--disable-discovery")
